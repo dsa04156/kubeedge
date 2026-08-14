@@ -2,6 +2,7 @@ package cloudstream
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/kubeedge/kubeedge/pkg/stream"
 )
@@ -186,6 +188,114 @@ func TestSession_Close(t *testing.T) {
 	assert.True(t, mockConn2.done)
 	assert.True(t, session.tunnelClosed)
 }
+
+func TestSessionClosePropagatesFailureToMetricsCompletion(t *testing.T) {
+	metricsConn := &ContainerMetricsConnection{
+		edgePeerStop:       make(chan struct{}, 1),
+		edgePeerCompletion: make(chan error, 1),
+		closeChan:          make(chan bool),
+	}
+	session := &Session{
+		tunnel: &mockTunnel{},
+		apiServerConn: map[uint64]APIServerConnection{
+			1: metricsConn,
+		},
+		apiConnlock: &sync.RWMutex{},
+	}
+
+	session.Close()
+
+	require.Len(t, metricsConn.edgePeerCompletion, 1)
+	assert.Error(t, <-metricsConn.edgePeerCompletion)
+}
+
+func TestSessionProxyPropagatesMetricsCompletionStatus(t *testing.T) {
+	tests := []struct {
+		name          string
+		data          []byte
+		wantError     error
+		wantErrorText string
+	}{
+		{
+			name: "explicit success",
+			data: func() []byte {
+				data, err := stream.EncodeConnectionCompletion(stream.ConnectionCompletionSuccess, nil)
+				require.NoError(t, err)
+				return data
+			}(),
+		},
+		{
+			name: "explicit error",
+			data: func() []byte {
+				data, err := stream.EncodeConnectionCompletion(stream.ConnectionCompletionError, errors.New("unexpected EOF"))
+				require.NoError(t, err)
+				return data
+			}(),
+			wantError:     stream.ErrConnectionCompletionFailed,
+			wantErrorText: "unexpected EOF",
+		},
+		{
+			name:      "legacy completion without status",
+			wantError: stream.ErrConnectionCompletionUnknown,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metricsConn := &ContainerMetricsConnection{
+				edgePeerStop:       make(chan struct{}, 1),
+				edgePeerCompletion: make(chan error, 1),
+				closeChan:          make(chan bool),
+			}
+			session := &Session{
+				apiServerConn: map[uint64]APIServerConnection{1: metricsConn},
+				apiConnlock:   &sync.RWMutex{},
+			}
+
+			err := session.ProxyTunnelMessageToApiserver(&stream.Message{
+				ConnectID:   1,
+				MessageType: stream.MessageTypeRemoveConnect,
+				Data:        tt.data,
+			})
+
+			require.NoError(t, err)
+			require.Len(t, metricsConn.edgePeerCompletion, 1)
+			completionErr := <-metricsConn.edgePeerCompletion
+			if tt.wantError == nil {
+				assert.NoError(t, completionErr)
+			} else {
+				assert.ErrorIs(t, completionErr, tt.wantError)
+				if tt.wantErrorText != "" {
+					assert.ErrorContains(t, completionErr, tt.wantErrorText)
+				}
+			}
+		})
+	}
+}
+
+func TestSessionServePropagatesTunnelFailureToMetricsCompletion(t *testing.T) {
+	wantErr := errors.New("premature tunnel disconnect")
+	mockTun := newMockTunnel()
+	mockTun.AddMessage(0, nil, wantErr)
+	metricsConn := &ContainerMetricsConnection{
+		edgePeerStop:       make(chan struct{}, 1),
+		edgePeerCompletion: make(chan error, 1),
+		closeChan:          make(chan bool),
+	}
+	session := &Session{
+		tunnel: mockTun,
+		apiServerConn: map[uint64]APIServerConnection{
+			1: metricsConn,
+		},
+		apiConnlock: &sync.RWMutex{},
+	}
+
+	session.Serve()
+
+	require.Len(t, metricsConn.edgePeerCompletion, 1)
+	assert.ErrorIs(t, <-metricsConn.edgePeerCompletion, wantErr)
+}
+
 func TestSession_ProxyTunnelMessageToApiserver(t *testing.T) {
 	tests := []struct {
 		name        string

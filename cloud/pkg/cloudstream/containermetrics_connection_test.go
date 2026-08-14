@@ -17,6 +17,7 @@ limitations under the License.
 package cloudstream
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/url"
@@ -166,4 +167,43 @@ func TestSendConnection_Metrics(t *testing.T) {
 
 	assert.NotNil(mockTunneler.lastMessage)
 	assert.Equal(stream.MessageTypeMetricConnect, mockTunneler.lastMessage.MessageType)
+}
+
+func TestServeMetricsReturnsExplicitCompletionResult(t *testing.T) {
+	mockReq := &http.Request{
+		URL:    &url.URL{Path: "/metrics/resource"},
+		Header: http.Header{},
+	}
+	tests := []struct {
+		name       string
+		completion error
+		wantError  bool
+	}{
+		{name: "success", completion: nil, wantError: false},
+		{name: "edge failure", completion: assert.AnError, wantError: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockTunneler := &MockTunneler{}
+			metricsConn := &ContainerMetricsConnection{
+				MessageID:          1,
+				ctx:                context.Background(),
+				r:                  &restful.Request{Request: mockReq},
+				session:            &Session{tunnel: mockTunneler},
+				edgePeerStop:       make(chan struct{}, 1),
+				edgePeerCompletion: make(chan error, 1),
+				closeChan:          make(chan bool),
+			}
+			metricsConn.SetEdgePeerCompletion(tt.completion)
+
+			err := metricsConn.Serve()
+
+			if tt.wantError {
+				assert.ErrorIs(t, err, tt.completion)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
 }

@@ -21,14 +21,14 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type MockResponseBody struct {
@@ -199,7 +199,7 @@ func TestMetricsConnection_write2CloudStream(t *testing.T) {
 	assert := assert.New(t)
 
 	mockTunneler := &MockStreamTunneler{}
-	stop := make(chan struct{}, 1)
+	result := make(chan error, 1)
 
 	responseBody := NewMockResponseBody("line1\nline2\nline3")
 	mockResponse := &http.Response{
@@ -210,15 +210,12 @@ func TestMetricsConnection_write2CloudStream(t *testing.T) {
 		MessID: uint64(100),
 	}
 
-	go metricsConn.write2CloudStream(mockTunneler, mockResponse, stop)
-
-	time.Sleep(100 * time.Millisecond)
+	metricsConn.write2CloudStream(mockTunneler, mockResponse, result)
 
 	assert.Equal(3, len(mockTunneler.Messages))
 	assert.Equal(MessageTypeData, mockTunneler.Messages[0].MessageType)
 	assert.Contains(string(mockTunneler.Messages[0].Data), "line1")
-
-	assert.Equal(1, len(stop))
+	assert.NoError(<-result)
 }
 
 func TestMetricsConnection_write2CloudStream_WriteError(t *testing.T) {
@@ -227,7 +224,7 @@ func TestMetricsConnection_write2CloudStream_WriteError(t *testing.T) {
 	mockTunneler := &MockStreamTunneler{
 		WriteErr: errors.New("tunnel write error"),
 	}
-	stop := make(chan struct{}, 1)
+	result := make(chan error, 1)
 
 	responseBody := NewMockResponseBody("test data for tunnel")
 	mockResponse := &http.Response{
@@ -238,61 +235,79 @@ func TestMetricsConnection_write2CloudStream_WriteError(t *testing.T) {
 		MessID: uint64(100),
 	}
 
-	go metricsConn.write2CloudStream(mockTunneler, mockResponse, stop)
+	metricsConn.write2CloudStream(mockTunneler, mockResponse, result)
 
-	time.Sleep(100 * time.Millisecond)
-
-	assert.Equal(1, len(stop))
+	assert.ErrorContains(<-result, "tunnel write error")
 }
 
 func TestMetricsConnection_Serve(t *testing.T) {
 	assert := assert.New(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, err := io.WriteString(w, "test metric data")
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+	metricsURL, err := url.Parse(server.URL + "/metrics")
+	require.NoError(t, err)
 
 	metricsConn := &EdgedMetricsConnection{
 		MessID:   uint64(100),
 		ReadChan: make(chan *Message, 10),
 		Stop:     make(chan struct{}, 1),
-		URL:      url.URL{Scheme: "https", Host: "example.com", Path: "/metrics"},
+		URL:      *metricsURL,
 		Header:   http.Header{},
 	}
 
 	mockTunneler := &MockStreamTunneler{}
 
-	responseBody := NewMockResponseBody("test metric data")
-	mockResponse := &http.Response{
-		StatusCode: 200,
-		Body:       responseBody,
-	}
-
-	patchNewRequest := gomonkey.ApplyFunc(http.NewRequest,
-		func(method, url string, body io.Reader) (*http.Request, error) {
-			return &http.Request{
-				Header: http.Header{},
-			}, nil
-		})
-	defer patchNewRequest.Reset()
-
-	patchDo := gomonkey.ApplyMethod(reflect.TypeOf(&http.Client{}), "Do",
-		func(_ *http.Client, _ *http.Request) (*http.Response, error) {
-			return mockResponse, nil
-		})
-	defer patchDo.Reset()
-
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		metricsConn.Stop <- struct{}{}
-	}()
-
-	err := metricsConn.Serve(mockTunneler)
+	err = metricsConn.Serve(mockTunneler)
 
 	assert.NoError(err)
 
-	found := false
+	var completionData []byte
 	for _, msg := range mockTunneler.Messages {
 		if msg.MessageType == MessageTypeRemoveConnect {
-			found = true
+			completionData = msg.Data
 			break
 		}
 	}
-	assert.True(found, "Expected a RemoveConnect message to be sent")
+	require.NotNil(t, completionData, "Expected a RemoveConnect message to be sent")
+	status, err := DecodeConnectionCompletion(completionData)
+	require.NoError(t, err)
+	assert.Equal(ConnectionCompletionSuccess, status)
+}
+
+func TestMetricsConnectionServeReportsScannerFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		_, err := io.WriteString(w, "partial metrics")
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+	metricsURL, err := url.Parse(server.URL + "/metrics")
+	require.NoError(t, err)
+	metricsConn := &EdgedMetricsConnection{
+		MessID:   uint64(100),
+		ReadChan: make(chan *Message, 10),
+		Stop:     make(chan struct{}, 1),
+		URL:      *metricsURL,
+		Header:   http.Header{},
+	}
+	mockTunneler := &MockStreamTunneler{}
+
+	err = metricsConn.Serve(mockTunneler)
+
+	assert.ErrorContains(t, err, "unexpected EOF")
+	var completionData []byte
+	for _, msg := range mockTunneler.Messages {
+		if msg.MessageType == MessageTypeRemoveConnect {
+			completionData = msg.Data
+			break
+		}
+	}
+	require.NotNil(t, completionData, "Expected an error completion message")
+	status, decodeErr := DecodeConnectionCompletion(completionData)
+	assert.ErrorIs(t, decodeErr, ErrConnectionCompletionFailed)
+	assert.ErrorContains(t, decodeErr, "unexpected EOF")
+	assert.Equal(t, ConnectionCompletionError, status)
 }

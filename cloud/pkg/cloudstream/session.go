@@ -17,6 +17,7 @@ limitations under the License.
 package cloudstream
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,8 @@ import (
 
 	"github.com/kubeedge/kubeedge/pkg/stream"
 )
+
+var errTunnelSessionClosed = errors.New("tunnel session closed before connection completion")
 
 // Session indicates one tunnel connection (default websocket) from edgecore
 // And multiple kube-apiserver initiated requests to this edgecore
@@ -49,31 +52,49 @@ func (s *Session) WriteMessageToTunnel(m *stream.Message) error {
 }
 
 func (s *Session) Close() {
+	s.closeWithError(errTunnelSessionClosed)
+}
+
+func (s *Session) closeWithError(err error) {
 	s.apiConnlock.Lock()
 	defer s.apiConnlock.Unlock()
 	for _, c := range s.apiServerConn {
-		c.SetEdgePeerDone()
+		setEdgePeerCompletion(c, err)
 	}
 	s.tunnel.Close()
 	s.tunnelClosed = true
 }
 
+func setEdgePeerCompletion(connection APIServerConnection, err error) {
+	if completionAware, ok := connection.(edgePeerCompletionAware); ok {
+		completionAware.SetEdgePeerCompletion(err)
+		return
+	}
+	connection.SetEdgePeerDone()
+}
+
 // Serve read tunnel message ,and write to specific apiserver connection
 func (s *Session) Serve() {
-	defer s.Close()
+	sessionErr := errTunnelSessionClosed
+	defer func() {
+		s.closeWithError(sessionErr)
+	}()
 
 	for {
 		t, r, err := s.tunnel.NextReader()
 		if err != nil {
+			sessionErr = fmt.Errorf("get %s reader: %w", s.String(), err)
 			klog.Errorf("get %v reader error %v", s.String(), err)
 			return
 		}
 		if t != websocket.TextMessage {
+			sessionErr = fmt.Errorf("websocket message type must be %v, got %v", websocket.TextMessage, t)
 			klog.Errorf("Websocket message type must be %v type", websocket.TextMessage)
 			return
 		}
 		message, err := stream.ReadMessageFromTunnel(r)
 		if err != nil {
+			sessionErr = fmt.Errorf("read message from %s: %w", s.String(), err)
 			klog.Errorf("Read message from tunnel %v error %v", s.String(), err)
 			return
 		}
@@ -96,7 +117,12 @@ func (s *Session) ProxyTunnelMessageToApiserver(message *stream.Message) error {
 	switch message.MessageType {
 	case stream.MessageTypeRemoveConnect:
 		klog.V(6).Infof("delete connection %v from %v", message.ConnectID, s.String())
-		kubeCon.SetEdgePeerDone()
+		if _, ok := kubeCon.(edgePeerCompletionAware); !ok {
+			kubeCon.SetEdgePeerDone()
+			break
+		}
+		_, err := stream.DecodeConnectionCompletion(message.Data)
+		setEdgePeerCompletion(kubeCon, err)
 	case stream.MessageTypeData:
 		for i := 0; i < len(message.Data); {
 			n, err := kubeCon.WriteToAPIServer(message.Data[i:])

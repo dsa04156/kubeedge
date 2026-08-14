@@ -78,10 +78,7 @@ func (ms *EdgedMetricsConnection) receiveFromCloudStream(stop chan struct{}) {
 	klog.V(6).Infof("%s read channel closed", ms.String())
 }
 
-func (ms *EdgedMetricsConnection) write2CloudStream(tunnel SafeWriteTunneler, resp *http.Response, stop chan struct{}) {
-	defer func() {
-		stop <- struct{}{}
-	}()
+func (ms *EdgedMetricsConnection) write2CloudStream(tunnel SafeWriteTunneler, resp *http.Response, result chan<- error) {
 	scan := bufio.NewScanner(resp.Body)
 	for scan.Scan() {
 		// 10 = \n
@@ -89,10 +86,27 @@ func (ms *EdgedMetricsConnection) write2CloudStream(tunnel SafeWriteTunneler, re
 		err := tunnel.WriteMessage(msg)
 		if err != nil {
 			klog.Errorf("write tunnel message %v error", msg)
+			result <- fmt.Errorf("write metrics data to tunnel: %w", err)
 			return
 		}
 		klog.V(4).Infof("%v write metrics data %v", ms.String(), string(scan.Bytes()))
 	}
+	result <- scan.Err()
+}
+
+func (ms *EdgedMetricsConnection) sendCompletion(tunnel SafeWriteTunneler, status ConnectionCompletionStatus, completionErr error) error {
+	data, err := EncodeConnectionCompletion(status, completionErr)
+	if err != nil {
+		return err
+	}
+	msg := NewMessage(ms.MessID, MessageTypeRemoveConnect, data)
+	for retry := 0; retry < 3; retry++ {
+		if err = tunnel.WriteMessage(msg); err == nil {
+			return nil
+		}
+		klog.Errorf("%v send %s message error %v", ms, msg.MessageType, err)
+	}
+	return fmt.Errorf("send metrics completion to tunnel: %w", err)
 }
 
 func (ms *EdgedMetricsConnection) Serve(tunnel SafeWriteTunneler) error {
@@ -113,28 +127,33 @@ func (ms *EdgedMetricsConnection) Serve(tunnel SafeWriteTunneler) error {
 	resp, err := client.Do(req)
 	if err != nil {
 		klog.Errorf("request metrics error %v", err)
+		if completionErr := ms.sendCompletion(tunnel, ConnectionCompletionError, err); completionErr != nil {
+			klog.Errorf("send metrics request failure completion error %v", completionErr)
+		}
 		return err
 	}
 	defer resp.Body.Close()
 
 	go ms.receiveFromCloudStream(ms.Stop)
 
-	defer func() {
-		for retry := 0; retry < 3; retry++ {
-			msg := NewMessage(ms.MessID, MessageTypeRemoveConnect, nil)
-			if err := tunnel.WriteMessage(msg); err != nil {
-				klog.Errorf("%v send %s message error %v", ms, msg.MessageType, err)
-			} else {
-				break
-			}
+	result := make(chan error, 1)
+	go ms.write2CloudStream(tunnel, resp, result)
+
+	select {
+	case <-ms.Stop:
+		klog.Infof("receive stop signal, so stop metrics scan ...")
+		return nil
+	case streamErr := <-result:
+		status := ConnectionCompletionSuccess
+		if streamErr != nil {
+			status = ConnectionCompletionError
 		}
-	}()
-
-	go ms.write2CloudStream(tunnel, resp, ms.Stop)
-
-	<-ms.Stop
-	klog.Infof("receive stop signal, so stop metrics scan ...")
-	return nil
+		completionErr := ms.sendCompletion(tunnel, status, streamErr)
+		if streamErr != nil {
+			return streamErr
+		}
+		return completionErr
+	}
 }
 
 var _ EdgedConnection = &EdgedMetricsConnection{}

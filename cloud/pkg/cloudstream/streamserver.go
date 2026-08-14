@@ -196,12 +196,13 @@ func (s *StreamServer) getMetrics(r *restful.Request, w *restful.Response) {
 	w.WriteHeader(http.StatusOK)
 
 	metricsConnection, err := session.AddAPIServerConnection(s, &ContainerMetricsConnection{
-		r:            r,
-		writer:       w.ResponseWriter,
-		session:      session,
-		ctx:          r.Request.Context(),
-		edgePeerStop: make(chan struct{}),
-		closeChan:    make(chan bool),
+		r:                  r,
+		writer:             w.ResponseWriter,
+		session:            session,
+		ctx:                r.Request.Context(),
+		edgePeerStop:       make(chan struct{}),
+		edgePeerCompletion: make(chan error),
+		closeChan:          make(chan bool),
 	})
 	if err != nil {
 		err = fmt.Errorf("add apiServer connection into %s error %v", session.String(), err)

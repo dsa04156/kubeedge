@@ -39,7 +39,10 @@ type ContainerMetricsConnection struct {
 	writer       io.Writer
 	session      *Session
 	edgePeerStop chan struct{}
-	closeChan    chan bool
+	// edgePeerCompletion carries an explicit result from completion-aware peers.
+	// edgePeerStop remains the legacy path where the result is unknown.
+	edgePeerCompletion chan error
+	closeChan          chan bool
 }
 
 func (ms *ContainerMetricsConnection) String() string {
@@ -69,6 +72,21 @@ func (ms *ContainerMetricsConnection) SetEdgePeerDone() {
 
 func (ms *ContainerMetricsConnection) EdgePeerDone() chan struct{} {
 	return ms.edgePeerStop
+}
+
+// SetEdgePeerCompletion records an explicit edge-side metrics result.
+func (ms *ContainerMetricsConnection) SetEdgePeerCompletion(err error) {
+	select {
+	case <-ms.closeChan:
+		return
+	case ms.edgePeerCompletion <- err:
+		klog.V(6).Infof("success send completion for connection with messageID %v", ms.MessageID)
+	}
+}
+
+// EdgePeerCompletion returns explicit edge-side metrics results.
+func (ms *ContainerMetricsConnection) EdgePeerCompletion() <-chan error {
+	return ms.edgePeerCompletion
 }
 
 func (ms *ContainerMetricsConnection) WriteToTunnel(m *stream.Message) error {
@@ -122,7 +140,9 @@ func (ms *ContainerMetricsConnection) Serve() error {
 			return nil
 		case <-ms.EdgePeerDone():
 			klog.V(6).Infof("%s find edge peer done, so stop this connection", ms.String())
-			return fmt.Errorf("%s find edge peer done, so stop this connection", ms.String())
+			return fmt.Errorf("%s find edge peer done without completion status", ms.String())
+		case err := <-ms.EdgePeerCompletion():
+			return err
 		}
 	}
 }

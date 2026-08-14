@@ -33,3 +33,9 @@ type APIServerConnection interface {
 	// EdgePeerDone indicates whether edge peer ends
 	EdgePeerDone() chan struct{}
 }
+
+// edgePeerCompletionAware is implemented by connections that can distinguish
+// an explicit peer result from a legacy completion signal.
+type edgePeerCompletionAware interface {
+	SetEdgePeerCompletion(error)
+}
