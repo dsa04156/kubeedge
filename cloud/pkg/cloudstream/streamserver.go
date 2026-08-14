@@ -200,8 +200,8 @@ func (s *StreamServer) getMetrics(r *restful.Request, w *restful.Response) {
 		writer:             w.ResponseWriter,
 		session:            session,
 		ctx:                r.Request.Context(),
-		edgePeerStop:       make(chan struct{}),
-		edgePeerCompletion: make(chan error),
+		edgePeerStop:       make(chan struct{}, 1),
+		edgePeerCompletion: make(chan error, 1),
 		closeChan:          make(chan bool),
 	})
 	if err != nil {
